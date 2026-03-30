@@ -1,10 +1,9 @@
 # WeWrite 写作参数（可优化）
-# 复制为 writing-config.yaml，然后用 optimize loop 迭代调优
-# 或手动调整后观察朱雀检测结果
+# 复制为 writing-config.yaml，在对话中说"优化参数"让 Agent 迭代调优
+# 或手动调整后用 humanness_score.py 评估
 #
 # 这个文件是起点，不是最优解。
-# 运行: python3 scripts/optimize_loop.py --topic "你的主题" --iterations 10
-# 每次迭代会修改 writing-config.yaml 中的参数，保留得分更好的版本。
+# 在对话中说"优化参数"即可自动调优，每轮调整得分最低的参数。
 #
 # 参数分三层，对应 writing-guide.md 的反检测结构。
 

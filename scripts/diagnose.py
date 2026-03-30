@@ -157,7 +157,7 @@ def check_enhancements():
     else:
         checks.append(make_check(
             "enhancement", "writing_config", "warn",
-            "not found → using defaults (run optimize_loop.py to tune)",
+            "not found → using defaults (say '优化参数' to tune)",
         ))
 
     # playbook.md
@@ -240,7 +240,7 @@ def compute_summary(checks):
         elif name == "playbook":
             recs.append('Edit a generated article, then say "学习我的修改" to build playbook.md')
         elif name == "writing_config":
-            recs.append('Run: python3 scripts/optimize_loop.py --topic "your topic" --iterations 10')
+            recs.append('Say "优化参数" to run the optimization loop')
         elif name == "history_articles":
             recs.append("Generate your first article to start building history")
         elif name == "dimension_variance":

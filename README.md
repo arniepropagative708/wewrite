@@ -168,7 +168,7 @@ wewrite/
 ├── SKILL.md                  # 主管道（273行，Step 1-8）
 ├── config.example.yaml       # API 配置模板
 ├── style.example.yaml        # 风格配置模板
-├── writing-config.example.yaml # 写作参数模板（可用 optimize loop 调优）
+├── writing-config.example.yaml # 写作参数模板（说"优化参数"自动调优）
 ├── requirements.txt
 │
 ├── dist/openclaw/            # OpenClaw 兼容版（CI 自动构建）
@@ -179,8 +179,7 @@ wewrite/
 │   ├── fetch_stats.py          # 微信文章数据回填
 │   ├── build_playbook.py       # 从历史文章生成 Playbook
 │   ├── learn_edits.py          # 学习人工修改
-│   ├── humanness_score.py      # 文章"人味"打分器（客观 checklist + LLM 判官）
-│   ├── optimize_loop.py        # autoresearch 风格迭代优化框架
+│   ├── humanness_score.py      # 文章"人味"打分器（11 项检测 + 参数映射）
 │   └── build_openclaw.py       # SKILL.md → OpenClaw 格式转换
 │
 ├── toolkit/                  # Markdown → 微信工具链
@@ -235,19 +234,25 @@ Step 8  写入历史 → 回复用户（含编辑建议 + 飞轮提示）
 
 默认全自动。说"交互模式"可在选题/框架/配图处暂停确认。
 
-## 优化循环（实验性）
+## 写作参数优化
 
-借鉴 [autoresearch](https://github.com/karpathy/autoresearch) 的 change→score→keep/rollback 模式，WeWrite 提供写作参数自动调优框架：
+在对话中说「优化写作参数」或「优化参数」，Agent 会自动迭代调优你的 `writing-config.yaml`：
+
+1. 用当前参数写测试短文
+2. 用 `humanness_score.py` 打分（11 项检测，连续 0-1 分数）
+3. 找到最低分维度，调整对应参数
+4. 重复 N 轮（默认 3 轮）
+5. 保留得分最好的参数组合
 
 ```bash
-# 对一篇文章打分（客观 checklist + 主观 LLM 判官）
+# 独立打分（不需要 Agent）
 python3 scripts/humanness_score.py article.md --verbose
 
-# 迭代优化写作参数
-python3 scripts/optimize_loop.py --topic "AI Agent" --iterations 10
+# JSON 输出（含每项分数 + 参数映射）
+python3 scripts/humanness_score.py article.md --json
 ```
 
-框架开源，但优化后的 `writing-config.yaml` 不入 git——每个用户跑出自己的最优参数。
+优化后的 `writing-config.yaml` 不入 git——每个用户跑出自己的最优参数。
 
 ## Toolkit 独立使用
 
