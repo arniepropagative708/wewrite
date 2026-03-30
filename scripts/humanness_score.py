@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
 """
-Fixed humanness scoring pipeline for WeWrite optimization loop.
+Humanness scoring for WeWrite articles.
 
-Two-layer scoring inspired by autoresearch + the "objective checklist + subjective feel" pattern:
+Three-tier evaluation aligned with writing-guide.md's anti-AI checklist:
 
-Layer 1: Objective checklist (yes/no, deterministic, won't drift)
-Layer 2: Subjective reader-feel (LLM judge, 1-10)
+  Tier 1 (Statistical, 50%): 6 checks measuring statistical properties
+         that AI detectors analyze (burstiness, distribution, variance).
+  Tier 2 (Pattern, 30%):     5 checks for specific linguistic patterns
+         (banned words, broken sentences, real sources).
+  Tier 3 (LLM, 20%):        Semantic analysis done by the agent in SKILL.md
+         (style drift, density waves, coherence). Passed via --tier3 flag.
 
-Composite = Layer1 pass_rate * 0.6 + Layer2 normalized * 0.4
+Each check outputs a continuous 0-1 score and maps to a writing-config
+parameter, so the optimization loop knows which knob to turn.
 
-DO NOT MODIFY this file during optimization. It is the fixed evaluation function.
+Standalone mode (no --tier3): weights redistribute to T1=62.5%, T2=37.5%.
 
 Usage:
-    python3 humanness_score.py article.md
-    python3 humanness_score.py article.md --verbose
-    python3 humanness_score.py article.md --json
+    python3 humanness_score.py article.md                    # single score
+    python3 humanness_score.py article.md --verbose          # detailed report
+    python3 humanness_score.py article.md --json             # full JSON
+    python3 humanness_score.py article.md --json --tier3 0.7 # with agent score
 """
 
 import argparse
@@ -25,7 +31,7 @@ from pathlib import Path
 
 
 # ============================================================
-# Layer 1: Objective Checklist (deterministic yes/no)
+# Constants
 # ============================================================
 
 BANNED_WORDS = [
@@ -39,255 +45,399 @@ BANNED_WORDS = [
     "正如我们所看到的",
 ]
 
-# Real-source indicators: named people, organizations, specific publications
 REAL_SOURCE_PATTERNS = [
-    r'[A-Z][a-z]+\s+[A-Z][a-z]+',  # Named person (English)
-    r'[\u4e00-\u9fff]{2,4}(?:表示|指出|认为|写道|提到|说过)',  # Chinese name + said
-    r'(?:据|根据|来自)\s*[\u4e00-\u9fff]+(?:报告|数据|研究|调查)',  # "according to X report"
-    r'20[12]\d\s*年',  # Specific year reference
-    r'\d+(?:\.\d+)?%',  # Specific percentage
-    r'(?:亿|万)\s*(?:美元|元|人民币)',  # Specific monetary amount
+    r'[A-Z][a-z]+\s+[A-Z][a-z]+',
+    r'[\u4e00-\u9fff]{2,4}(?:表示|指出|认为|写道|提到|说过)',
+    r'(?:据|根据|来自)\s*[\u4e00-\u9fff]+(?:报告|数据|研究|调查)',
+    r'20[12]\d\s*年',
+    r'\d+(?:\.\d+)?%',
+    r'(?:亿|万)\s*(?:美元|元|人民币)',
+]
+
+NEGATIVE_MARKERS = [
+    "失望", "糟糕", "扯", "坑", "烂", "差劲", "崩溃", "吐槽", "骂",
+    "怒", "烦", "焦虑", "担忧", "不满", "恶心", "可怕", "可悲", "可笑",
+    "离谱", "尴尬", "无语", "蠢", "惨", "亏", "危",
+    "太扯了", "说实话我很失望", "搞什么", "不靠谱", "受不了",
+]
+
+COMMON_ADVERBS = [
+    "非常", "十分", "极其", "特别", "相当", "尤其", "格外",
+    "更加", "越来越", "逐渐", "不断", "始终", "一直",
+    "已经", "正在", "将要", "可能", "大概", "或许",
+    "似乎", "显然", "明显", "确实", "果然", "居然",
+    "竟然", "简直", "几乎", "完全", "绝对", "必然",
+]
+
+COLD_WORDS = ["边际", "认知负荷", "信息不对称", "路径依赖", "商业模式", "生态系统", "增量"]
+WARM_WORDS = ["说白了", "其实吧", "讲真", "说实话", "坦白讲", "懂的都懂", "怎么说呢"]
+HOT_WORDS = ["DNA动了", "格局打开", "遥遥��先", "卷", "内卷", "炸了", "杀疯了", "吃灰"]
+WILD_WORDS = ["整挺好", "不靠谱", "瞎折腾", "搁这儿", "糊弄", "扯", "嗯"]
+
+SELF_CORRECTION_PATTERNS = [
+    r'不对[，,]', r'准确说', r'算了', r'说错了',
+    r'其实不是', r'我记混了', r'应该说', r'更准确地说',
+    r'（[^）]{4,}）',  # Chinese parenthetical insertion (≥4 chars)
+]
+
+BROKEN_SENTENCE_PATTERNS = [
+    r'——(?!.*[，。！？])',
+    r'\.{3,}|…',
+    r'不对[，,]',
+    r'算了',
 ]
 
 
-def check_no_banned_words(text: str) -> tuple[bool, str]:
-    """Check: zero banned words."""
+# ============================================================
+# Helpers
+# ============================================================
+
+def _split_sentences(text):
+    """Split text by Chinese sentence-ending punctuation."""
+    sentences = re.split(r'[。！？\n]', text)
+    return [s.strip() for s in sentences if s.strip() and len(s.strip()) > 1]
+
+
+def _split_paragraphs(text):
+    """Split text into paragraphs, excluding headings."""
+    return [p.strip() for p in text.split('\n\n')
+            if p.strip() and not p.strip().startswith('#')]
+
+
+def _make_result(score, detail, param=None):
+    """Create a check result dict."""
+    r = {"score": round(max(0.0, min(1.0, score)), 4), "detail": detail}
+    if param is not None:
+        r["param"] = param
+    else:
+        r["param"] = None
+    return r
+
+
+# ============================================================
+# Tier 1: Statistical Checks (weight 50%)
+# ============================================================
+
+def score_sentence_length_stddev(text):
+    """[1.1] Sentence length standard deviation. → sentence_variance"""
+    sentences = _split_sentences(text)
+    if len(sentences) < 5:
+        return _make_result(0.5, "too few sentences to measure", "sentence_variance")
+    lengths = [len(s) for s in sentences]
+    mean = sum(lengths) / len(lengths)
+    variance = sum((l - mean) ** 2 for l in lengths) / len(lengths)
+    stddev = variance ** 0.5
+    score = min(1.0, stddev / 25.0)
+    return _make_result(score, f"stddev={stddev:.1f} (target ≥15)", "sentence_variance")
+
+
+def score_sentence_length_range(text):
+    """[1.1] Sentence length range (max - min). → sentence_variance"""
+    sentences = _split_sentences(text)
+    if len(sentences) < 5:
+        return _make_result(0.5, "too few sentences", "sentence_variance")
+    lengths = [len(s) for s in sentences]
+    rng = max(lengths) - min(lengths)
+    range_score = min(1.0, rng / 40.0)
+    # Check for single-sentence short paragraphs
+    lines = text.split('\n')
+    short_paras = sum(1 for l in lines if l.strip() and 1 <= len(l.strip()) <= 5
+                      and not l.strip().startswith('#'))
+    expected = max(1, len(text) / 500)
+    short_score = min(1.0, short_paras / expected)
+    score = range_score * 0.6 + short_score * 0.4
+    return _make_result(score, f"range={rng} (target ≥30), short_paras={short_paras}", "sentence_variance")
+
+
+def score_paragraph_length_variance(text):
+    """[1.3] Paragraph length variance. → paragraph_rhythm"""
+    paragraphs = _split_paragraphs(text)
+    if len(paragraphs) < 3:
+        return _make_result(0.5, "too few paragraphs", "paragraph_rhythm")
+    total_pairs = len(paragraphs) - 1
+    similar = sum(1 for i in range(total_pairs)
+                  if abs(len(paragraphs[i]) - len(paragraphs[i + 1])) <= 20)
+    score = 1.0 - (similar / total_pairs) if total_pairs > 0 else 0.5
+    return _make_result(score, f"{similar}/{total_pairs} consecutive similar-length pairs", "paragraph_rhythm")
+
+
+def score_vocabulary_richness(text):
+    """[1.2] CJK bigram type-token ratio + temperature mix. → word_temperature_bias"""
+    cjk_chars = re.findall(r'[\u4e00-\u9fff]', text)
+    if len(cjk_chars) < 20:
+        return _make_result(0.5, "too few CJK characters", "word_temperature_bias")
+    bigrams = [cjk_chars[i] + cjk_chars[i + 1] for i in range(len(cjk_chars) - 1)]
+    ttr = len(set(bigrams)) / len(bigrams) if bigrams else 0
+    ttr_score = min(1.0, ttr / 0.7)
+    # Temperature mix bonus
+    found_temps = sum([
+        any(w in text for w in COLD_WORDS),
+        any(w in text for w in WARM_WORDS),
+        any(w in text for w in HOT_WORDS),
+        any(w in text for w in WILD_WORDS),
+    ])
+    temp_bonus = found_temps / 4.0 * 0.3
+    score = min(1.0, ttr_score * 0.7 + temp_bonus)
+    return _make_result(score, f"bigram_ttr={ttr:.3f}, temps={found_temps}/4", "word_temperature_bias")
+
+
+def score_negative_emotion_ratio(text):
+    """[1.4] Negative emotion ratio. → emotional_arc"""
+    sentences = _split_sentences(text)
+    if not sentences:
+        return _make_result(0.5, "no sentences", "emotional_arc")
+    negative_count = sum(1 for s in sentences
+                         if any(m in s for m in NEGATIVE_MARKERS))
+    ratio = negative_count / len(sentences)
+    score = min(1.0, ratio / 0.25)
+    return _make_result(score, f"negative={negative_count}/{len(sentences)} ({ratio:.0%}, target ≥20%)", "emotional_arc")
+
+
+def score_adverb_density(text):
+    """[1.5] Adverb density control. → adverb_max_per_100"""
+    char_count = len(text)
+    if char_count < 50:
+        return _make_result(0.5, "text too short", "adverb_max_per_100")
+    # Count adverb occurrences
+    total_adverbs = sum(text.count(adv) for adv in COMMON_ADVERBS)
+    density = total_adverbs / char_count * 100
+    # Check consecutive sentences starting with adverbs
+    sentences = _split_sentences(text)
+    consecutive_adverb_starts = 0
+    for i in range(len(sentences) - 1):
+        a_starts = any(sentences[i].startswith(adv) for adv in COMMON_ADVERBS)
+        b_starts = any(sentences[i + 1].startswith(adv) for adv in COMMON_ADVERBS)
+        if a_starts and b_starts:
+            consecutive_adverb_starts += 1
+    score = 1.0
+    if density > 3.0:
+        score -= min(0.5, (density - 3.0) * 0.1)
+    score -= consecutive_adverb_starts * 0.3
+    return _make_result(score, f"density={density:.1f}/100chars, consecutive_starts={consecutive_adverb_starts}", "adverb_max_per_100")
+
+
+# ============================================================
+# Tier 2: Pattern Checks (weight 30%)
+# ============================================================
+
+def score_banned_words(text):
+    """[2.1] Banned word check. → null (hard rule, no config param)"""
     found = [w for w in BANNED_WORDS if w in text]
-    if found:
-        return False, f"Found {len(found)} banned words: {found[:5]}"
-    return True, "0 banned words"
+    score = max(0.0, 1.0 - len(found) * 0.2)
+    detail = "0 banned words" if not found else f"{len(found)} found: {found[:5]}"
+    return _make_result(score, detail, None)
 
 
-def check_real_sources(text: str) -> tuple[bool, str]:
-    """Check: article references real external sources (≥3 instances)."""
-    count = 0
-    for pattern in REAL_SOURCE_PATTERNS:
-        count += len(re.findall(pattern, text))
-    if count >= 3:
-        return True, f"{count} real-source indicators found"
-    return False, f"Only {count} real-source indicators (need ≥3)"
-
-
-def check_broken_sentences(text: str) -> tuple[bool, str]:
-    """Check: ≥3 broken/incomplete sentences (dashes, ellipsis, self-corrections)."""
-    patterns = [
-        r'——(?!.*[，。！？])',  # em-dash interruption without ending punct
-        r'\.{3,}|…',  # ellipsis
-        r'不对[，,]',  # self-correction "不对，"
-        r'算了',  # abandonment "算了"
-        r'^.{1,6}[。！？]$',  # ultra-short sentence (≤6 chars + punct) as standalone line
-    ]
+def score_broken_sentences(text):
+    """[2.2] Broken/incomplete sentence patterns. → broken_sentence_rate"""
     count = 0
     lines = text.split('\n')
     for line in lines:
         line = line.strip()
         if not line:
             continue
-        for p in patterns:
+        for p in BROKEN_SENTENCE_PATTERNS:
             count += len(re.findall(p, line))
-        # Check for ultra-short standalone paragraphs (1-10 chars)
         if 1 <= len(line) <= 10 and not line.startswith('#'):
             count += 1
-    if count >= 3:
-        return True, f"{count} broken/incomplete structures"
-    return False, f"Only {count} broken structures (need ≥3)"
+    char_count = len(text)
+    expected = max(3, char_count / 500 * 3)
+    score = min(1.0, count / expected)
+    return _make_result(score, f"{count} broken structures (expected ≥{expected:.0f})", "broken_sentence_rate")
 
 
-def check_sentence_length_variance(text: str) -> tuple[bool, str]:
-    """Check: sentence length standard deviation > threshold.
-
-    AI text has suspiciously uniform sentence lengths.
-    Human text varies wildly (3-char to 80-char sentences in the same paragraph).
-    """
-    # Split by Chinese sentence-ending punctuation
-    sentences = re.split(r'[。！？\n]', text)
-    sentences = [s.strip() for s in sentences if s.strip() and len(s.strip()) > 1]
-
-    if len(sentences) < 5:
-        return False, "Too few sentences to measure"
-
-    lengths = [len(s) for s in sentences]
-    mean = sum(lengths) / len(lengths)
-    variance = sum((l - mean) ** 2 for l in lengths) / len(lengths)
-    stddev = variance ** 0.5
-
-    # Threshold: human text typically has stddev > 15 chars
-    # AI text tends to be 8-12
-    if stddev > 15:
-        return True, f"Sentence length stddev = {stddev:.1f} (good variance)"
-    return False, f"Sentence length stddev = {stddev:.1f} (too uniform, need >15)"
+def score_real_sources(text):
+    """[3.1] Real external source indicators. → real_data_density"""
+    count = 0
+    for pattern in REAL_SOURCE_PATTERNS:
+        count += len(re.findall(pattern, text))
+    score = min(1.0, count / 5.0)
+    return _make_result(score, f"{count} real-source indicators (target ≥5)", "real_data_density")
 
 
-def check_paragraph_length_variance(text: str) -> tuple[bool, str]:
-    """Check: no consecutive paragraphs of similar length."""
-    paragraphs = [p.strip() for p in text.split('\n\n') if p.strip() and not p.strip().startswith('#')]
-    if len(paragraphs) < 3:
-        return True, "Too few paragraphs to check"
-
-    consecutive_similar = 0
-    for i in range(len(paragraphs) - 1):
-        len_a = len(paragraphs[i])
-        len_b = len(paragraphs[i + 1])
-        if abs(len_a - len_b) <= 20:
-            consecutive_similar += 1
-
-    if consecutive_similar <= 1:
-        return True, f"{consecutive_similar} consecutive similar-length pairs (OK)"
-    return False, f"{consecutive_similar} consecutive similar-length pairs (too uniform)"
+def score_word_temperature_mix(text):
+    """[1.2] Word temperature band coverage. → word_temperature_bias"""
+    found_temps = sum([
+        any(w in text for w in COLD_WORDS),
+        any(w in text for w in WARM_WORDS),
+        any(w in text for w in HOT_WORDS),
+        any(w in text for w in WILD_WORDS),
+    ])
+    score = max(0.0, (found_temps - 1) / 3.0)
+    return _make_result(score, f"{found_temps}/4 temperature bands", "word_temperature_bias")
 
 
-def check_word_temperature_mix(text: str) -> tuple[bool, str]:
-    """Check: mix of formal/colloquial/slang/wild vocabulary."""
-    cold = ["边际", "认知负荷", "信息不对称", "路径依赖", "商业模式", "生态系统", "增量"]
-    warm = ["说白了", "其实吧", "讲真", "说实话", "坦白讲", "懂的都懂", "怎么说呢"]
-    hot = ["DNA动了", "格局打开", "遥遥领先", "卷", "内卷", "炸了", "杀疯了", "吃灰"]
-    wild = ["整挺好", "不靠谱", "瞎折腾", "搁这儿", "糊弄", "扯", "嗯"]
-
-    found_temps = 0
-    if any(w in text for w in cold): found_temps += 1
-    if any(w in text for w in warm): found_temps += 1
-    if any(w in text for w in hot): found_temps += 1
-    if any(w in text for w in wild): found_temps += 1
-
-    if found_temps >= 3:
-        return True, f"{found_temps}/4 temperature types found"
-    return False, f"Only {found_temps}/4 temperature types (need ≥3)"
+def score_self_correction(text):
+    """[2.2] Self-correction and parenthetical patterns. → self_correction_rate"""
+    count = 0
+    for pattern in SELF_CORRECTION_PATTERNS:
+        count += len(re.findall(pattern, text))
+    score = min(1.0, count / 3.0)
+    return _make_result(score, f"{count} self-corrections/insertions (target ≥3)", "self_correction_rate")
 
 
-def run_layer1(text: str) -> dict:
-    """Run all Layer 1 checks. Returns dict with results."""
-    checks = [
-        ("no_banned_words", check_no_banned_words),
-        ("real_sources", check_real_sources),
-        ("broken_sentences", check_broken_sentences),
-        ("sentence_length_variance", check_sentence_length_variance),
-        ("paragraph_length_variance", check_paragraph_length_variance),
-        ("word_temperature_mix", check_word_temperature_mix),
-    ]
+# ============================================================
+# Tier Runners
+# ============================================================
 
+TIER1_CHECKS = [
+    ("sentence_length_stddev", score_sentence_length_stddev),
+    ("sentence_length_range", score_sentence_length_range),
+    ("paragraph_length_variance", score_paragraph_length_variance),
+    ("vocabulary_richness", score_vocabulary_richness),
+    ("negative_emotion_ratio", score_negative_emotion_ratio),
+    ("adverb_density", score_adverb_density),
+]
+
+TIER2_CHECKS = [
+    ("banned_words", score_banned_words),
+    ("broken_sentences", score_broken_sentences),
+    ("real_sources", score_real_sources),
+    ("word_temperature_mix", score_word_temperature_mix),
+    ("self_correction", score_self_correction),
+]
+
+
+def run_tier(checks, text):
+    """Run a tier of checks. Returns dict keyed by check name + _summary."""
     results = {}
-    passed = 0
-    total = len(checks)
-
+    scores = []
     for name, fn in checks:
-        ok, detail = fn(text)
-        results[name] = {"passed": ok, "detail": detail}
-        if ok:
-            passed += 1
-
+        r = fn(text)
+        results[name] = r
+        scores.append(r["score"])
     results["_summary"] = {
-        "passed": passed,
-        "total": total,
-        "pass_rate": round(passed / total, 4),
+        "count": len(checks),
+        "mean_score": round(sum(scores) / len(scores), 4) if scores else 0,
+        "scores": [round(s, 4) for s in scores],
     }
     return results
-
-
-# ============================================================
-# Layer 2: Subjective Reader-Feel (LLM judge)
-# ============================================================
-
-JUDGE_PROMPT = """你是一个经验丰富的公众号读者。你对 AI 生成的内容非常敏感——你能凭直觉分辨出人写的和 AI 写的。
-
-现在请你阅读下面这篇文章，然后回答一个问题：
-
-**这篇文章读起来像人写的吗？**
-
-评分标准（1-10）：
-- 1-3：明显是 AI 写的。语言过于规整，没有个人色彩，像教科书。
-- 4-5：有一些 AI 痕迹。整体流畅但缺乏个人经历、情感起伏或出人意料的表达。
-- 6-7：大部分像人写的，偶尔有几句感觉"太完美了"。
-- 8-9：很像人写的。有个人风格、情感波动、不完美感，像一个真人编辑的作品。
-- 10：完全像人写的。如果不告诉我，我不会怀疑这是 AI 参与的。
-
-请只输出一个 JSON：{"score": 数字, "reason": "一句话理由"}
-
----
-
-文章内容：
-
-{article}
-"""
-
-
-def run_layer2_stub(text: str) -> dict:
-    """Layer 2 stub — returns placeholder when no LLM API available.
-
-    In production, this calls Claude/GPT to judge the article.
-    For the optimization loop, replace this with actual API call.
-    """
-    return {
-        "score": 5.0,
-        "reason": "(stub) LLM judge not configured — using default score",
-        "is_stub": True,
-    }
 
 
 # ============================================================
 # Composite Score
 # ============================================================
 
-def compute_composite(layer1: dict, layer2: dict) -> float:
-    """Composite score: lower is better (like val_bpb in autoresearch).
+def compute_composite(tier1, tier2, tier3_score=None):
+    """Compute composite score (0=human, 100=AI).
 
-    Inverted so that 0 = perfect human, 100 = obvious AI.
+    With tier3: T1=50%, T2=30%, T3=20%
+    Without:    T1=62.5%, T2=37.5%
     """
-    l1_pass_rate = layer1["_summary"]["pass_rate"]
-    l2_score = layer2["score"] / 10.0  # normalize to 0-1
+    t1_mean = tier1["_summary"]["mean_score"]
+    t2_mean = tier2["_summary"]["mean_score"]
 
-    # Composite: higher pass_rate and higher reader score = more human
-    humanness = l1_pass_rate * 0.6 + l2_score * 0.4
+    if tier3_score is not None:
+        humanness = t1_mean * 0.50 + t2_mean * 0.30 + tier3_score * 0.20
+        weights = {"tier1": 0.50, "tier2": 0.30, "tier3": 0.20}
+    else:
+        humanness = t1_mean * 0.625 + t2_mean * 0.375
+        weights = {"tier1": 0.625, "tier2": 0.375}
 
-    # Invert: 0 = perfect human, 100 = obvious AI
-    return round((1 - humanness) * 100, 2)
+    composite = round((1 - humanness) * 100, 2)
+    return composite, weights
+
+
+def build_param_scores(tier1, tier2):
+    """Build flat param→score map for optimization. Averages if multiple checks map to same param."""
+    param_map = {}
+    for tier in [tier1, tier2]:
+        for name, data in tier.items():
+            if name.startswith("_"):
+                continue
+            param = data.get("param")
+            if param is None:
+                continue
+            if param not in param_map:
+                param_map[param] = []
+            param_map[param].append(data["score"])
+    return {p: round(sum(scores) / len(scores), 4) for p, scores in param_map.items()}
 
 
 # ============================================================
-# Main
+# Main API
 # ============================================================
 
-def score_article(text: str, verbose: bool = False) -> dict:
+def score_article(text, verbose=False, tier3_score=None):
     """Score an article. Returns full results dict."""
-    # Strip markdown headers for scoring
     clean = re.sub(r'^#+\s+.*$', '', text, flags=re.MULTILINE).strip()
 
-    layer1 = run_layer1(clean)
-    layer2 = run_layer2_stub(clean)
-    composite = compute_composite(layer1, layer2)
+    tier1 = run_tier(TIER1_CHECKS, clean)
+    tier2 = run_tier(TIER2_CHECKS, clean)
+    composite, weights = compute_composite(tier1, tier2, tier3_score)
+    param_scores = build_param_scores(tier1, tier2)
 
     result = {
         "composite_score": composite,
-        "layer1": layer1,
-        "layer2": layer2,
+        "tier1": tier1,
+        "tier2": tier2,
+        "tier3": {
+            "score": tier3_score,
+            "source": "agent" if tier3_score is not None else "not_available",
+        },
+        "weights": weights,
+        "param_scores": param_scores,
         "char_count": len(clean),
     }
 
     if verbose:
-        print(f"\n{'='*60}")
-        print(f"HUMANNESS SCORE: {composite:.1f}/100 (lower = more human)")
-        print(f"{'='*60}")
-        print(f"\nLayer 1 — Objective Checklist ({layer1['_summary']['passed']}/{layer1['_summary']['total']})")
-        for name, data in layer1.items():
-            if name.startswith('_'):
-                continue
-            status = "✓" if data["passed"] else "✗"
-            print(f"  {status} {name}: {data['detail']}")
-        print(f"\nLayer 2 — Reader Feel: {layer2['score']}/10")
-        print(f"  {layer2['reason']}")
-        print(f"\nComposite: {composite:.1f} (0=完美人类, 100=明显AI)")
+        _print_verbose(result)
 
     return result
 
 
+def _print_verbose(result):
+    """Print a human-readable report."""
+    composite = result["composite_score"]
+    print(f"\n{'=' * 60}")
+    print(f"HUMANNESS SCORE: {composite:.1f}/100 (lower = more human)")
+    print(f"{'=' * 60}")
+
+    for tier_name, tier_label, weight in [
+        ("tier1", "Tier 1 — Statistical", result["weights"].get("tier1", 0)),
+        ("tier2", "Tier 2 — Pattern", result["weights"].get("tier2", 0)),
+    ]:
+        tier = result[tier_name]
+        summary = tier["_summary"]
+        print(f"\n{tier_label} (weight {weight:.0%}, mean {summary['mean_score']:.2f})")
+        for name, data in tier.items():
+            if name.startswith("_"):
+                continue
+            bar = "█" * int(data["score"] * 10) + "░" * (10 - int(data["score"] * 10))
+            param_tag = f" [{data['param']}]" if data.get("param") else ""
+            print(f"  {bar} {data['score']:.2f}  {name}{param_tag}")
+            print(f"         {data['detail']}")
+
+    t3 = result["tier3"]
+    if t3["score"] is not None:
+        t3_weight = result["weights"].get("tier3", 0)
+        print(f"\nTier 3 — LLM (weight {t3_weight:.0%})")
+        print(f"  Score: {t3['score']:.2f} (source: {t3['source']})")
+    else:
+        print(f"\nTier 3 — LLM: not available (standalone mode)")
+
+    print(f"\nComposite: {composite:.1f} (0=完美人类, 100=明显AI)")
+    print(f"Weights: {result['weights']}")
+
+    param_scores = result["param_scores"]
+    if param_scores:
+        sorted_params = sorted(param_scores.items(), key=lambda x: x[1])
+        print(f"\nLowest-scoring parameters (optimize these first):")
+        for param, score in sorted_params[:3]:
+            print(f"  {param}: {score:.2f}")
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Score article humanness")
+    parser = argparse.ArgumentParser(description="Score article humanness (0=human, 100=AI)")
     parser.add_argument("input", help="Markdown article file")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Detailed output")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Detailed report")
     parser.add_argument("--json", action="store_true", help="JSON output")
+    parser.add_argument("--tier3", type=float, default=None,
+                        help="Tier 3 LLM score (0-1), passed by agent from SKILL.md")
     args = parser.parse_args()
 
     text = Path(args.input).read_text(encoding="utf-8")
-    result = score_article(text, verbose=args.verbose)
+    result = score_article(text, verbose=args.verbose, tier3_score=args.tier3)
 
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
