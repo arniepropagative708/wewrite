@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """fetch_article.py — extract WeChat article content as Markdown.
 
-Three-level fetching strategy:
+Four-level fetching strategy:
   Level 1: requests (fast, zero overhead, works for most articles)
-  Level 2: Playwright headless Chrome (bypasses anti-scraping JS checks)
-  Level 3: Prompt user to save HTML manually and pass via --file
+  Level 2: Camoufox anti-detection browser (bypasses WeChat bot verification)
+  Level 3: Playwright headless Chrome (fallback)
+  Level 4: Prompt user to save HTML manually and pass via --file
 
 Usage:
     python3 scripts/fetch_article.py <url>                    # auto fetch
@@ -44,8 +45,31 @@ def _fetch_requests(url: str, timeout: int = 20) -> str | None:
         return None
 
 
+def _fetch_camoufox(url: str) -> str | None:
+    """Level 2: Camoufox anti-detection browser. Returns HTML or None."""
+    try:
+        from camoufox.sync_api import Camoufox
+    except ImportError:
+        return None
+
+    try:
+        with Camoufox(headless=True) as browser:
+            page = browser.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            try:
+                page.wait_for_selector("#js_content", timeout=10000)
+            except Exception:
+                pass  # timeout — still try to parse
+            import time
+            time.sleep(2)  # let JS finish rendering
+            html = page.content()
+            return html
+    except Exception:
+        return None
+
+
 def _fetch_playwright(url: str, timeout: int = 30000) -> str | None:
-    """Level 2: Playwright headless Chrome. Returns HTML or None."""
+    """Level 3: Playwright headless Chrome. Returns HTML or None."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -70,18 +94,24 @@ def fetch_html(url: str) -> str:
 
     Returns HTML string. Exits with error if all levels fail.
     """
-    # Level 1
+    # Level 1: plain requests
     html = _fetch_requests(url)
     if html and _has_content(html):
         return html
 
-    # Level 2
-    print("requests 未获取到正文，尝试 Playwright...", file=sys.stderr)
+    # Level 2: Camoufox anti-detection browser
+    print("requests 未获取到正文，尝试 Camoufox...", file=sys.stderr)
+    html = _fetch_camoufox(url)
+    if html and _has_content(html):
+        return html
+
+    # Level 3: Playwright fallback
+    print("Camoufox 未获取到正文，尝试 Playwright...", file=sys.stderr)
     html = _fetch_playwright(url)
     if html and _has_content(html):
         return html
 
-    # Level 3
+    # Level 4: manual
     print(
         "Error: 无法获取文章内容。请在浏览器中打开文章 → 右键另存为 HTML → 使用 --file 参数传入。",
         file=sys.stderr,
@@ -230,6 +260,11 @@ def html_to_markdown(soup: BeautifulSoup) -> str:
     content = soup.find(id="js_content")
     if content is None:
         return ""
+
+    # WeChat lazy-loads #js_content with visibility:hidden; JS removes it later.
+    # Strip the style so _elem_to_md doesn't skip the entire container.
+    if content.get("style"):
+        del content["style"]
 
     raw = _elem_to_md(content)
 
